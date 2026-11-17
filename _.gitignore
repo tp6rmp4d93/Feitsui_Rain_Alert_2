@@ -1,0 +1,11 @@
+# 機密與執行狀態一律不進版控
+.env
+.env.*
+!.env.example
+state.json
+state.tmp
+__pycache__/
+*.pyc
+venv/
+.wrangler/
+.dev.vars
