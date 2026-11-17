@@ -8,8 +8,8 @@
 警戒條件：任一雨量站或集水區平均
           24 小時累積 >= 170 mm  或  3 小時累積 >= 70 mm
 
-JSON 提供的是逐時資料，3 小時 / 24 小時累積由本程式把每小時雨量存進 state.json 後自行加總。
-若 JSON 本身已有「3小時」「24小時」累積欄位，則直接採用。
+JSON 每次只提供最新一小時的各站雨量，3 小時 / 24 小時累積由本程式把每小時雨量
+存進 state.json 後自行加總。
 
 用法：
   python feitsui_rain_alert.py --once       # 只檢查一次（GitHub Actions 排程使用）
@@ -73,14 +73,19 @@ LINE_TO = [x.strip() for x in env("LINE_TO").split(",") if x.strip()]  # 空白 
 # cumulative = 雨量欄位是「當日累積雨量」，程式改以前後兩筆相減求出每小時雨量
 RAIN_MODE = env("RAIN_MODE", "hourly").lower()
 
-# 欄位名稱比對（JSON 欄位用字不同時，可用環境變數覆寫）
-RAIN_KEY = re.compile(env("RAIN_KEY_PATTERN", r"雨|rain"), re.I)
-TIME_KEY = re.compile(env("TIME_KEY_PATTERN", r"時間|日期|time|date"), re.I)
-STATION_KEY = re.compile(r"站名|測站|站別|station|stname", re.I)
-LEVEL_KEY = re.compile(r"水位|waterlevel|water_level", re.I)
-CUM_KEY = re.compile(r"累積|累計|本日|日雨量|total|accum|sum", re.I)
-KEY_3H = re.compile(env("KEY_3H_PATTERN", r"(?<![\d.])3\s*(?:小時|hrs?)"), re.I)
-KEY_24H = re.compile(env("KEY_24H_PATTERN", r"(?<![\d.])24\s*(?:小時|hrs?)"), re.I)
+# 來源 JSON 欄位（依翡管局 Feitsui_HourlyJSON.ashx 的實際格式）
+TIME_FIELD = "DTime"
+LEVEL_FIELD = "WLevel_capacity"        # 水位 (m)
+STORAGE_PCT_FIELD = "EVpercentage"     # 蓄水率 (%)
+STATIONS = {
+    "Feutsui": "翡翠",
+    "PingLin": "坪林",
+    "ShiSanGu": "十三股",
+    "JiuQiongGen": "九芎根",
+    "BiHu": "碧湖",
+    "TaiPing": "太平",
+    "Watershed_weighted_average": "集水區加權平均",
+}
 
 WINDOWS = {
     "3h": {"label": "3小時累積", "threshold": TH_3H, "hours": 3},
@@ -247,15 +252,6 @@ def parse_dt(s: str):
         return None
 
 
-def record_time(rec: dict):
-    vals = [str(v) for k, v in rec.items() if TIME_KEY.search(k) and isinstance(v, (str, int))]
-    for cand in vals + [" ".join(vals)]:
-        dt = parse_dt(cand)
-        if dt:
-            return dt
-    return None
-
-
 def walk(node):
     if isinstance(node, dict):
         yield node
@@ -266,63 +262,46 @@ def walk(node):
             yield from walk(v)
 
 
-def make_label(key: str, station, n_rain_keys: int) -> str:
-    core = re.sub(r"時?雨量|累積|累計|本日|24\s*小時|3\s*小時|\(?mm\)?|rainfall|rain|[_\s]", "", key, flags=re.I)
-    if station:
-        return station if n_rain_keys == 1 or not core else f"{station}{core}"
-    return core or "集水區雨量"
-
-
 def ingest(payload, state: dict, now: datetime, check_stale: bool = True) -> dict:
     """
     把 JSON 內的逐時雨量併入 state["history"]，並算出各站 3hr / 24hr 累積。
-    回傳 {"data_time", "stations": {站: {"3h","24h"}}, "coverage": {站: {"3h","24h"}}, "level", "sample"}
+    回傳 {"data_time", "stations": {站: {"3h","24h"}}, "coverage": {站: {"3h","24h"}},
+          "level", "storage_pct", "sample"}
     """
     records = []
     for d in walk(payload):
-        rains = {}
-        for k, v in d.items():
-            if RAIN_KEY.search(k) and not TIME_KEY.search(k):
-                f = to_float(v)
-                if f is not None and f >= 0:        # 負值（如 -999）視為缺測
-                    rains[k] = f
-        if not rains:
+        if TIME_FIELD not in d or not any(k in d for k in STATIONS):
             continue
-        t = record_time(d) or now
-        station = next((v.strip() for k, v in d.items()
-                        if STATION_KEY.search(k) and isinstance(v, str) and v.strip()), None)
-        records.append((t.replace(minute=0, second=0, microsecond=0), station, rains, d))
+        t = parse_dt(str(d[TIME_FIELD]))
+        if t is None:
+            continue
+        rains = {}
+        for field, name in STATIONS.items():
+            f = to_float(d.get(field))
+            if f is not None and f >= 0:            # 負值（如 -999）或空值視為缺測
+                rains[name] = f
+        records.append((t.replace(minute=0, second=0, microsecond=0), rains, d))
     if not records:
-        raise RuntimeError("JSON 中找不到雨量欄位，請用 --dump 檢查欄位名稱並調整 RAIN_KEY_PATTERN")
+        raise RuntimeError("JSON 欄位與預期不同（找不到 DTime 或雨量站欄位），來源格式可能已變更")
     records.sort(key=lambda r: r[0])
 
     history = state.setdefault("history", {})      # {時間: {站: 該小時雨量}}
     last_raw = state.setdefault("last_raw", {})    # cumulative 模式用
-    direct = {}                                    # JSON 直接提供的 3hr/24hr 累積
-    for t, station, rains, _ in records:
+    for t, rains, _ in records:
         tk = t.strftime(TFMT)
-        for k, v in rains.items():
-            label = make_label(k, station, len(rains))
-            if KEY_24H.search(k):
-                direct.setdefault(tk, {}).setdefault(label, {})["24h"] = v
-            elif KEY_3H.search(k):
-                direct.setdefault(tk, {}).setdefault(label, {})["3h"] = v
-            elif RAIN_MODE == "cumulative":
-                prev = last_raw.get(label)
+        for name, v in rains.items():
+            if RAIN_MODE == "cumulative":
+                prev = last_raw.get(name)
                 if prev and tk <= prev["t"]:
                     continue
                 # 第一筆沒有前值無法相減，記 0 以免把整天累積當成一小時而誤報
                 delta = 0.0 if not prev else (v - prev["v"] if v >= prev["v"] else v)
-                last_raw[label] = {"t": tk, "v": v}
-                history.setdefault(tk, {})[label] = round(delta, 2)
-            elif not CUM_KEY.search(k):
-                history.setdefault(tk, {})[label] = v
+                last_raw[name] = {"t": tk, "v": v}
+                history.setdefault(tk, {})[name] = round(delta, 2)
+            else:
+                history.setdefault(tk, {})[name] = v
 
-    if not history and not direct:
-        raise RuntimeError("只找到累積型雨量欄位，請設定 RAIN_MODE=cumulative")
-
-    latest_key = max(list(history) + list(direct))
-    latest = datetime.strptime(latest_key, TFMT)
+    latest, _, last_rec = records[-1]
     if check_stale and now - latest > timedelta(hours=STALE_HOURS):
         raise RuntimeError(f"來源資料過舊，最新一筆為 {latest:%Y/%m/%d %H:%M}")
     cutoff = (latest - timedelta(hours=30)).strftime(TFMT)
@@ -330,24 +309,18 @@ def ingest(payload, state: dict, now: datetime, check_stale: bool = True) -> dic
         del history[k]
 
     stations, coverage = {}, {}
-    labels = list(dict.fromkeys(l for h in history.values() for l in h))
-    for label in labels:
-        stations[label], coverage[label] = {}, {}
+    for name in STATIONS.values():
+        stations[name], coverage[name] = {}, {}
         for key, w in WINDOWS.items():
-            vals = [history.get((latest - timedelta(hours=i)).strftime(TFMT), {}).get(label)
+            vals = [history.get((latest - timedelta(hours=i)).strftime(TFMT), {}).get(name)
                     for i in range(w["hours"])]
             vals = [v for v in vals if v is not None]
-            stations[label][key] = round(sum(vals), 2) if vals else None
-            coverage[label][key] = len(vals)
-    for label, vals in direct.get(latest_key, {}).items():
-        stations.setdefault(label, {"3h": None, "24h": None}).update(vals)
-        coverage.setdefault(label, {}).update({k: WINDOWS[k]["hours"] for k in vals})
+            stations[name][key] = round(sum(vals), 2) if vals else None
+            coverage[name][key] = len(vals)
 
-    last_rec = records[-1][3]
-    level = next((to_float(v) for k, v in last_rec.items()
-                  if LEVEL_KEY.search(k) and to_float(v) is not None), None)
     return {"data_time": latest.strftime("%Y/%m/%d %H:%M"), "stations": stations,
-            "coverage": coverage, "level": level, "sample": last_rec}
+            "coverage": coverage, "level": to_float(last_rec.get(LEVEL_FIELD)),
+            "storage_pct": to_float(last_rec.get(STORAGE_PCT_FIELD)), "sample": last_rec}
 
 
 # ---------------------------------------------------------------- LINE
@@ -441,7 +414,9 @@ def build_message(result, new, remind, cleared) -> str:
         section("✅ 已降至警戒值以下", cleared)
     lines.append("")
     if result.get("level") is not None:
-        lines.append(f"水庫水位：{result['level']:g} m")
+        pct = result.get("storage_pct")
+        lines.append(f"水庫水位：{result['level']:g} m"
+                     + (f"（蓄水率 {pct:.1f}%）" if pct is not None else ""))
     lines += [f"資料時間：{data_time}", "來源：翡翠水庫即時水情資料"]
     return "\n".join(lines)
 
@@ -505,9 +480,13 @@ def main() -> int:
         return 0
 
     if args.dump:
-        from_file = payload is not None
-        result = ingest(payload if from_file else fetch_json(), load_state(), now_taipei(),
-                        check_stale=False)
+        if payload is None:
+            payload = fetch_json()
+        raw = json.dumps(payload, ensure_ascii=False, indent=2)
+        print("來源 JSON 原始內容" + ("（僅顯示前 4000 字）" if len(raw) > 4000 else "") + "：")
+        print(raw[:4000])
+        print()
+        result = ingest(payload, load_state(), now_taipei(), check_stale=False)
         print("最新一筆原始資料：")
         print(json.dumps(result["sample"], ensure_ascii=False, indent=2))
         print(f"\n資料時間：{result['data_time']}　水位：{result['level']}　RAIN_MODE={RAIN_MODE}")

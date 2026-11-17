@@ -11,14 +11,11 @@ Cloudflare Worker（Webhook，選用）◀── LINE 平台：只用來查 user
 
 ## 雨量如何計算
 
-JSON 是逐時資料，程式把每小時、每個雨量欄位的數值存進 `state.json`（保留近 30 小時），再加總出 3 小時與 24 小時累積。
+JSON 每次只提供**最新一小時**的資料：翡翠、坪林、十三股、九芎根、碧湖、太平六個雨量站，加上集水區加權平均。程式把每小時的數值存進 `state.json`（保留近 30 小時），再加總出 3 小時與 24 小時累積。
 
-- JSON 一次回傳多個小時時，會全部併入，啟用後立刻有完整累積值。
-- JSON 只回傳最新一小時時，要等程式自己累積：**啟用後前 3 / 24 小時的累積值會偏低**。通知訊息會標示「僅累計到 N/24 小時」。
+- **啟用後前 3 / 24 小時的累積值會偏低**，因為歷史要靠程式自己累積。通知訊息會標示「僅累計到 N/24 小時」。
 - 監測中斷超過一小時（排程被跳過、來源異常）會漏掉那幾個小時，累積值同樣偏低。
-- 欄位名稱含「雨」或 `rain` 的數值欄位都視為一個測站；JSON 若有集水區平均欄位會一併納入，沒有的話就只比對各站。
-- 若 JSON 已直接提供「3小時」「24小時」累積欄位，則優先採用。
-- 雨量欄位若是「當日累積」而非「該小時雨量」，請把 Variable `RAIN_MODE` 設為 `cumulative`，程式會改用前後兩筆相減。
+- 程式假設欄位是「該小時雨量」。若下雨時發現數值其實是「當日累積」，請把 Variable `RAIN_MODE` 設為 `cumulative`，程式會改用前後兩筆相減。
 
 ## 一、機密放在哪裡
 
@@ -47,11 +44,11 @@ repo 內的檔案（程式、workflow、`worker.js`）都不含任何機密，�
    - *Workflow permissions* 選 **Read repository contents and packages permissions**
    - *Fork pull request workflows* 選 **Require approval for all external contributors**
 4. **Actions** 分頁 → *Feitsui rain alert* → **Run workflow**，依序驗證：
-   - `dump`：log 會印出最新一筆原始 JSON 與各測站的計算結果。請核對測站是否齊全、數值是「時雨量」還是「當日累積」
+   - `dump`：log 會印出來源 JSON 與七個測站的計算結果
    - `test-line`：LINE 應收到測試訊息
 5. 之後排程會自動每 10 分鐘以 `once` 模式執行。
 
-選用的調整值放在同頁的 **Variables** 分頁（非機密）：`RENOTIFY_MINUTES`、`VERIFY_SSL`、`RAIN_MODE`、`RAIN_KEY_PATTERN`。
+選用的調整值放在同頁的 **Variables** 分頁（非機密）：`RENOTIFY_MINUTES`、`RAIN_MODE`。來源網站的憑證鏈不完整，程式會自動補齊中繼憑證後驗證，不需要額外設定。
 
 ## 四、Webhook 設定
 
