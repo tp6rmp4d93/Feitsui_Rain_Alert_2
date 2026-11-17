@@ -90,35 +90,119 @@ TFMT = "%Y-%m-%dT%H:%M"
 
 
 # ---------------------------------------------------------------- 抓取與解析
-def ssl_verify():
+_ca_bundle = None      # 補齊中繼憑證後的 CA 清單路徑（同一次執行內重複使用）
+
+
+def _load_certs(raw: bytes) -> list:
+    """AIA 下載到的檔案可能是 DER、PEM 或 PKCS#7(.p7b/.p7c)。"""
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import pkcs7
+    for loader in (lambda: [x509.load_der_x509_certificate(raw)],
+                   lambda: [x509.load_pem_x509_certificate(raw)],
+                   lambda: pkcs7.load_der_pkcs7_certificates(raw),
+                   lambda: pkcs7.load_pem_pkcs7_certificates(raw)):
+        try:
+            return list(loader())
+        except Exception:  # noqa: BLE001
+            continue
+    return []
+
+
+def fetch_intermediates(host: str, port: int) -> str:
     """
-    VERIFY_SSL=0：不驗證來源網站憑證。
-    repo 根目錄若有 ca-extra.pem（來源網站缺少的中繼憑證），則併入內建 CA 清單後照常驗證。
+    來源網站沒有送出中繼憑證時，依憑證內的 AIA 網址逐層下載補齊（瀏覽器的做法）。
+    只收中繼憑證、不收自簽根憑證，所以整條鏈仍須接到內建受信任的根憑證才會通過驗證。
     """
-    if not VERIFY_SSL:
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        return False
-    extra = BASE_DIR / "ca-extra.pem"
-    if extra.exists():
-        import tempfile
-        import certifi
-        bundle = Path(tempfile.gettempdir()) / "feitsui-ca-bundle.pem"
-        bundle.write_text(Path(certifi.where()).read_text(encoding="utf-8") + "\n"
-                          + extra.read_text(encoding="utf-8"), encoding="utf-8")
-        return str(bundle)
-    return True
+    import ssl
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import Encoding
+    from cryptography.x509.oid import AuthorityInformationAccessOID, ExtensionOID
+
+    cert = x509.load_pem_x509_certificate(
+        ssl.get_server_certificate((host, port), timeout=20).encode())
+    pems = []
+    for _ in range(4):
+        try:
+            aia = cert.extensions.get_extension_for_oid(
+                ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
+        except x509.ExtensionNotFound:
+            break
+        urls = [d.access_location.value for d in aia
+                if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS]
+        issuer = None
+        for url in urls:
+            try:
+                raw = requests.get(url, timeout=20).content
+            except requests.RequestException:
+                continue
+            issuer = next((c for c in _load_certs(raw) if c.subject == cert.issuer), None)
+            if issuer:
+                break
+        if issuer is None or issuer.subject == issuer.issuer:
+            break
+        pems.append(issuer.public_bytes(Encoding.PEM).decode())
+        cert = issuer
+    return "".join(pems)
+
+
+def build_bundle(extra_pem: str) -> str:
+    import tempfile
+    import certifi
+    path = Path(tempfile.gettempdir()) / "feitsui-ca-bundle.pem"
+    path.write_text(Path(certifi.where()).read_text(encoding="utf-8") + "\n" + extra_pem,
+                    encoding="utf-8")
+    return str(path)
 
 
 def fetch_json():
-    r = requests.get(
-        SOURCE_URL,
-        timeout=30,
-        verify=ssl_verify(),
-        headers={"User-Agent": "Mozilla/5.0 (feitsui-rain-alert)", "Accept": "application/json"},
-    )
-    r.raise_for_status()
-    return decode_json(r.content)
+    """
+    憑證驗證順序：
+      1. VERIFY_SSL=0 → 不驗證
+      2. 一般驗證（若 repo 根目錄有 ca-extra.pem 則一併信任）
+      3. 失敗時自動下載缺少的中繼憑證後再驗證一次
+    """
+    global _ca_bundle
+    from urllib.parse import urlparse
+
+    def get(verify):
+        r = requests.get(
+            SOURCE_URL, timeout=30, verify=verify,
+            headers={"User-Agent": "Mozilla/5.0 (feitsui-rain-alert)", "Accept": "application/json"},
+        )
+        r.raise_for_status()
+        return decode_json(r.content)
+
+    if not VERIFY_SSL:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        log.info("VERIFY_SSL=0：不驗證來源網站憑證")
+        return get(False)
+
+    extra_file = BASE_DIR / "ca-extra.pem"
+    extra = extra_file.read_text(encoding="utf-8") if extra_file.exists() else ""
+    verify = _ca_bundle or (build_bundle(extra) if extra else True)
+    try:
+        return get(verify)
+    except requests.exceptions.SSLError as first:
+        if _ca_bundle:
+            raise RuntimeError(f"來源網站憑證驗證失敗：{first}") from None
+        log.info("來源網站憑證鏈不完整，嘗試自動補齊中繼憑證")
+        try:
+            u = urlparse(SOURCE_URL)
+            pems = fetch_intermediates(u.hostname, u.port or 443)
+            if not pems:
+                raise RuntimeError("憑證內沒有可用的中繼憑證下載網址")
+            bundle = build_bundle(extra + "\n" + pems)
+            data = get(bundle)
+            _ca_bundle = bundle
+            log.info("已補齊 %d 張中繼憑證，驗證通過", pems.count("BEGIN CERTIFICATE"))
+            return data
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                "來源網站憑證驗證失敗，自動補齊中繼憑證也未成功"
+                f"（{type(e).__name__}: {str(e)[:200]}）。"
+                "目前 VERIFY_SSL=1；若要略過驗證，請將環境變數 VERIFY_SSL 設為 0。"
+            ) from None
 
 
 def decode_json(raw: bytes):
@@ -451,3 +535,6 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(0)
+    except Exception as e:  # noqa: BLE001
+        print(f"錯誤：{e}", file=sys.stderr)
+        sys.exit(1)
