@@ -90,11 +90,31 @@ TFMT = "%Y-%m-%dT%H:%M"
 
 
 # ---------------------------------------------------------------- 抓取與解析
+def ssl_verify():
+    """
+    VERIFY_SSL=0：不驗證來源網站憑證。
+    repo 根目錄若有 ca-extra.pem（來源網站缺少的中繼憑證），則併入內建 CA 清單後照常驗證。
+    """
+    if not VERIFY_SSL:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        return False
+    extra = BASE_DIR / "ca-extra.pem"
+    if extra.exists():
+        import tempfile
+        import certifi
+        bundle = Path(tempfile.gettempdir()) / "feitsui-ca-bundle.pem"
+        bundle.write_text(Path(certifi.where()).read_text(encoding="utf-8") + "\n"
+                          + extra.read_text(encoding="utf-8"), encoding="utf-8")
+        return str(bundle)
+    return True
+
+
 def fetch_json():
     r = requests.get(
         SOURCE_URL,
         timeout=30,
-        verify=VERIFY_SSL,
+        verify=ssl_verify(),
         headers={"User-Agent": "Mozilla/5.0 (feitsui-rain-alert)", "Accept": "application/json"},
     )
     r.raise_for_status()
