@@ -51,7 +51,6 @@ jobs:
           VERIFY_SSL: ${{ vars.VERIFY_SSL || '1' }}
           RENOTIFY_MINUTES: ${{ vars.RENOTIFY_MINUTES || '180' }}
           RAIN_MODE: ${{ vars.RAIN_MODE || 'hourly' }}
-          RAIN_KEY_PATTERN: ${{ vars.RAIN_KEY_PATTERN }}
           MODE: ${{ inputs.mode || 'once' }}
         run: python feitsui_rain_alert.py "--$MODE"
 
